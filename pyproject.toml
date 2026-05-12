@@ -1,7 +1,16 @@
 [project]
-name = "mlops-project"
+name = "youtube_agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "A YouTube agent to analyze comments."
+authors = [{ name = "Madat Mustafayev", email = "mustafayev.madat@gmail.com"},{ name = "Ibrahim Israfilov", email = "ibritics@gmail.com"}]
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = []
+
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
