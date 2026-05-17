@@ -5,7 +5,7 @@ description = "A YouTube agent to analyze comments."
 authors = [{ name = "Madat Mustafayev", email = "mustafayev.madat@gmail.com"},{ name = "Ibrahim Israfilov", email = "ibritics@gmail.com"}]
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 
 [build-system]

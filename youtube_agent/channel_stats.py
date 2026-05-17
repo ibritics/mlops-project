@@ -1,167 +1,327 @@
+import time
 import pandas as pd
 import isodate
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from dateutil import parser
-# from feel_it import EmotionClassifier, SentimentClassifier
+from pathlib import Path
+import yaml
+
+
+# ── API Key Loader ────────────────────────────────────────────────────────────
+
+def load_api_key(
+    path: Path | str = Path(__file__).resolve().parents[1] / "secret" / "api_key.yaml"
+) -> str:
+    """Load the API key from a local secret YAML file."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"API key file not found: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    api_key = data.get("api_key") if isinstance(data, dict) else None
+    if not api_key:
+        raise ValueError(f"'api_key' field not found in {path}")
+    return api_key
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _handle_http_error(e: HttpError, context: str = "") -> None:
+    """Print a clear diagnosis for common YouTube API errors and re-raise."""
+    status = e.resp.status
+    reason = ""
+    try:
+        import json
+        details = json.loads(e.content).get("error", {})
+        reason = details.get("errors", [{}])[0].get("reason", "")
+    except Exception:
+        pass
+
+    if status == 403:
+        if reason == "forbidden" or "blocked" in str(e.content):
+            print("\n" + "=" * 60)
+            print("❌  403 FORBIDDEN – YouTube Data API v3 is BLOCKED")
+            print("=" * 60)
+            print("Most likely causes (fix any one of these):")
+            print("  1. YouTube Data API v3 is NOT enabled on your project.")
+            print("     → https://console.cloud.google.com/apis/library")
+            print("        Search 'YouTube Data API v3' → Enable")
+            print()
+            print("  2. Your API key has API restrictions that exclude YouTube.")
+            print("     → APIs & Services → Credentials → your key")
+            print("        API restrictions → add 'YouTube Data API v3'")
+            print()
+            print("  3. Billing is not enabled on the Cloud project.")
+            print("     → https://console.cloud.google.com/billing")
+            print("=" * 60 + "\n")
+        elif reason == "quotaExceeded":
+            print("❌  403 Quota exceeded. Daily limit reached (10,000 units).")
+    elif status == 404:
+        print(f"❌  404 Not found ({context}). Check the ID.")
+    raise e
+
+
+# ── YouTubeAgent ──────────────────────────────────────────────────────────────
 
 class YouTubeAgent:
     def __init__(self, api_key: str):
-        self.youtube = build('youtube', 'v3', developerKey=api_key)
-        # Initialize classifiers once to save memory/load time
-        # self.emotion_clf = EmotionClassifier()
-        # self.sentiment_clf = SentimentClassifier()
+        self.youtube = build("youtube", "v3", developerKey=api_key)
 
-    def get_channel_stats(self, channel_id: str):
-        """Fetches general channel statistics."""
-        request = self.youtube.channels().list(
-            part="snippet,contentDetails,statistics",
-            id=channel_id
+    # ── Channel ───────────────────────────────────────────────────────────────
+
+    def resolve_channel_id(self, input_str: str) -> str:
+        """
+        Accept a UC… channel ID, @handle, or legacy username and always
+        return the canonical UC… channel ID.
+        """
+        # Already a proper channel ID
+        if input_str.startswith("UC") and len(input_str) == 24:
+            return input_str
+
+        handle = input_str.lstrip("@")
+
+        # Try forHandle (modern)
+        try:
+            resp = self.youtube.channels().list(
+                part="id", forHandle=handle
+            ).execute()
+            if resp.get("items"):
+                return resp["items"][0]["id"]
+        except HttpError as e:
+            _handle_http_error(e, "resolve_channel_id/forHandle")
+
+        # Try forUsername (legacy)
+        try:
+            resp = self.youtube.channels().list(
+                part="id", forUsername=handle
+            ).execute()
+            if resp.get("items"):
+                return resp["items"][0]["id"]
+        except HttpError as e:
+            _handle_http_error(e, "resolve_channel_id/forUsername")
+
+        raise ValueError(
+            f"Could not resolve '{input_str}' to a YouTube channel ID. "
+            "Make sure it is a valid @handle, username, or UC… ID."
         )
-        response = request.execute()
-        item = response['items'][0]
-        
+
+    def get_channel_stats(self, channel_id: str) -> dict:
+        """Fetch general channel statistics."""
+        # Auto-resolve handles / usernames
+        channel_id = self.resolve_channel_id(channel_id)
+
+        try:
+            request = self.youtube.channels().list(
+                part="snippet,contentDetails,statistics",
+                id=channel_id
+            )
+            response = request.execute()
+        except HttpError as e:
+            _handle_http_error(e, "get_channel_stats")
+
+        items = response.get("items", [])
+        if not items:
+            raise ValueError(
+                f"No channel found for ID '{channel_id}'.\n"
+                "Possible reasons:\n"
+                "  • The channel ID is wrong or the channel was deleted.\n"
+                "  • The channel is private.\n"
+                "  • The API key / YouTube Data API v3 is not properly set up.\n"
+                "Verify in browser: "
+                f"https://www.googleapis.com/youtube/v3/channels"
+                f"?part=snippet&id={channel_id}&key=YOUR_KEY"
+            )
+
+        item = items[0]
+        stats = item.get("statistics", {})
         return {
-            'channelName': item['snippet']['title'],
-            'subscribers': int(item['statistics']['subscriberCount']),
-            'views': int(item['statistics']['viewCount']),
-            'totalVideos': int(item['statistics']['videoCount']),
-            'playlistId': item['contentDetails']['relatedPlaylists']['uploads']
+            "channelName":  item["snippet"]["title"],
+            "subscribers":  int(stats.get("subscriberCount", 0)),
+            "views":        int(stats.get("viewCount", 0)),
+            "totalVideos":  int(stats.get("videoCount", 0)),
+            "playlistId":   item["contentDetails"]["relatedPlaylists"]["uploads"],
         }
 
-    def get_all_video_ids(self, playlist_id: str):
-        """Efficiently retrieves all video IDs from a playlist using pagination."""
-        video_ids = []
+    # ── Playlist / Video IDs ──────────────────────────────────────────────────
+
+    def get_all_video_ids(self, playlist_id: str, max_retries: int = 3) -> list[str]:
+        """Retrieve all video IDs from a playlist using pagination."""
+        video_ids: list[str] = []
         next_page_token = None
-        
+
         while True:
-            request = self.youtube.playlistItems().list(
-                part='contentDetails',
-                playlistId=playlist_id,
-                maxResults=50,
-                pageToken=next_page_token
+            for attempt in range(1, max_retries + 1):
+                try:
+                    request = self.youtube.playlistItems().list(
+                        part="contentDetails",
+                        playlistId=playlist_id,
+                        maxResults=50,
+                        pageToken=next_page_token,
+                    )
+                    response = request.execute()
+                    break  # success
+                except HttpError as e:
+                    if e.resp.status == 429 and attempt < max_retries:
+                        wait = 60 * attempt
+                        print(f"Rate limited. Retrying in {wait}s… (attempt {attempt})")
+                        time.sleep(wait)
+                    else:
+                        _handle_http_error(e, "get_all_video_ids")
+
+            items = response.get("items", [])
+            if not items:
+                break
+
+            video_ids.extend(
+                item["contentDetails"]["videoId"] for item in items
             )
-            response = request.execute()
-            
-            video_ids.extend([item['contentDetails']['videoId'] for item in response['items']])
-            next_page_token = response.get('nextPageToken')
-            
+            next_page_token = response.get("nextPageToken")
             if not next_page_token:
                 break
+
         return video_ids
 
-    def get_video_details(self, video_ids: list):
-        """Retrieves details for videos in batches of 50 (API limit)."""
+    # ── Video Details ─────────────────────────────────────────────────────────
+
+    def get_video_details(self, video_ids: list[str]) -> pd.DataFrame:
+        """Retrieve video metadata in batches of 50 (API limit)."""
         all_video_info = []
-        
+
         for i in range(0, len(video_ids), 50):
-            chunk = video_ids[i:i+50]
-            request = self.youtube.videos().list(
-                part="snippet,contentDetails,statistics",
-                id=','.join(chunk)
-            )
-            response = request.execute()
+            chunk = video_ids[i : i + 50]
+            try:
+                request = self.youtube.videos().list(
+                    part="snippet,contentDetails,statistics",
+                    id=",".join(chunk),
+                )
+                response = request.execute()
+            except HttpError as e:
+                _handle_http_error(e, "get_video_details")
 
-            for video in response.get('items', []):
-                snippet = video.get('snippet', {})
-                stats = video.get('statistics', {})
-                content = video.get('contentDetails', {})
+            for video in response.get("items", []):
+                snippet = video.get("snippet", {})
+                stats   = video.get("statistics", {})
+                content = video.get("contentDetails", {})
 
-                info = {
-                    'video_id': video['id'],
-                    'title': snippet.get('title'),
-                    'publishedAt': parser.parse(snippet.get('publishedAt')).replace(tzinfo=None),
-                    'duration': isodate.parse_duration(content.get('duration')).total_seconds(),
-                    'viewCount': int(stats.get('viewCount', 0)),
-                    'likeCount': int(stats.get('likeCount', 0)),
-                    'commentCount': int(stats.get('commentCount', 0)),
-                    'tags': snippet.get('tags', [])
-                }
-                all_video_info.append(info)
-        
+                duration_raw = content.get("duration")
+                duration_sec = (
+                    isodate.parse_duration(duration_raw).total_seconds()
+                    if duration_raw else 0
+                )
+
+                published_raw = snippet.get("publishedAt")
+                published_at  = (
+                    parser.parse(published_raw).replace(tzinfo=None)
+                    if published_raw else None
+                )
+
+                all_video_info.append({
+                    "video_id":     video["id"],
+                    "title":        snippet.get("title"),
+                    "description":  snippet.get("description", ""),
+                    "publishedAt":  published_at,
+                    "duration":     duration_sec,
+                    "viewCount":    int(stats.get("viewCount",    0)),
+                    "likeCount":    int(stats.get("likeCount",    0)),
+                    "commentCount": int(stats.get("commentCount", 0)),
+                    "tags":         snippet.get("tags", []),
+                })
+
         return pd.DataFrame(all_video_info)
 
-    def get_comments(self, video_ids: list, max_comments_per_video=100):
-        """Fetches comments and replies for a list of videos."""
-        all_comments = []
+    def get_video_list(self, playlist_id: str, sort_desc: bool = True) -> pd.DataFrame:
+        """Return a full channel video list with metadata, sorted by publish time."""
+        video_ids = self.get_all_video_ids(playlist_id)
+        df = self.get_video_details(video_ids)
+        if "publishedAt" in df.columns:
+            df = df.sort_values("publishedAt", ascending=not sort_desc).reset_index(drop=True)
+        return df
+
+    # ── Comments ──────────────────────────────────────────────────────────────
+
+    def get_comments(
+        self, video_ids: list[str], max_comments_per_video: int = 100
+    ) -> pd.DataFrame:
+        """Fetch top-level comments and replies for a list of videos."""
+        all_comments: list[dict] = []
 
         for v_id in video_ids:
             try:
                 next_page_token = None
                 count = 0
+
                 while count < max_comments_per_video:
                     request = self.youtube.commentThreads().list(
                         part="snippet,replies",
                         videoId=v_id,
-                        maxResults=100,
+                        maxResults=min(100, max_comments_per_video - count),
                         pageToken=next_page_token,
-                        textFormat="plainText"
+                        textFormat="plainText",
                     )
                     response = request.execute()
 
-                    for item in response.get('items', []):
-                        # Top-level comment
-                        top_comment = item['snippet']['topLevelComment']['snippet']
+                    for item in response.get("items", []):
+                        top = item["snippet"]["topLevelComment"]["snippet"]
                         all_comments.append({
-                            'video_id': v_id,
-                            'type': 'original',
-                            'text': top_comment['textOriginal'],
-                            'author': top_comment['authorDisplayName'],
-                            'likes': top_comment['likeCount'],
-                            'time': parser.parse(top_comment['publishedAt']).replace(tzinfo=None)
+                            "video_id": v_id,
+                            "type":     "original",
+                            "text":     top["textOriginal"],
+                            "author":   top["authorDisplayName"],
+                            "likes":    top["likeCount"],
+                            "time":     parser.parse(top["publishedAt"]).replace(tzinfo=None),
                         })
 
-                        # Replies
-                        if 'replies' in item:
-                            for reply in item['replies']['comments']:
-                                all_comments.append({
-                                    'video_id': v_id,
-                                    'type': 'reply',
-                                    'text': reply['snippet']['textOriginal'],
-                                    'author': reply['snippet']['authorDisplayName'],
-                                    'likes': reply['snippet']['likeCount'],
-                                    'time': parser.parse(reply['snippet']['publishedAt']).replace(tzinfo=None)
-                                })
-                    
-                    count += len(response.get('items', []))
-                    next_page_token = response.get('nextPageToken')
-                    if not next_page_token: break
+                        for reply in item.get("replies", {}).get("comments", []):
+                            s = reply["snippet"]
+                            all_comments.append({
+                                "video_id": v_id,
+                                "type":     "reply",
+                                "text":     s["textOriginal"],
+                                "author":   s["authorDisplayName"],
+                                "likes":    s["likeCount"],
+                                "time":     parser.parse(s["publishedAt"]).replace(tzinfo=None),
+                            })
 
-            except Exception as e:
-                print(f"Skipping video {v_id}: Comments might be disabled.")
-        
+                    count += len(response.get("items", []))
+                    next_page_token = response.get("nextPageToken")
+                    if not next_page_token:
+                        break
+
+            except HttpError as e:
+                if e.resp.status in (403, 404):
+                    print(f"⚠  Skipping video {v_id}: comments disabled or video unavailable.")
+                else:
+                    print(f"⚠  Skipping video {v_id}: {e}")
+
         return pd.DataFrame(all_comments)
 
-    def analyze_sentiment(self, df: pd.DataFrame, text_column='text'):
-        """Performs batch sentiment and emotion analysis."""
-        if df.empty: return df
-        
-        texts = df[text_column].tolist()
-        df['emotion'] = self.emotion_clf.predict(texts)
-        df['sentiment'] = self.sentiment_clf.predict(texts)
-        return df
-API_KEY = "AIzaSyBFDxewfxKIzNkBhSBKlSUJzxESenU6L9Q"
-CHANNEL_ID = "UCeZ7biz6kkMcEcyma7lUcFA"
 
-agent = YouTubeAgent(API_KEY)
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-# 1. Channel Stats
-print("Fetching Channel Stats...")
-channel_info = agent.get_channel_stats(CHANNEL_ID)
-pd.DataFrame([channel_info]).to_excel("01_channel_report.xlsx", index=False)
+if __name__ == "__main__":
+    API_KEY    = load_api_key()
+    CHANNEL_ID = "UC7eBNeDW1GQf2NJQ6G6gAxw"   # ← your channel ID
 
-# 2. Get Video IDs and Details
-print("Fetching Video Details...")
-video_ids = agent.get_all_video_ids(channel_info['playlistId'])
-video_df = agent.get_video_details(video_ids)
-video_df.to_excel("02_video_insights.xlsx", index=False)
+    agent = YouTubeAgent(API_KEY)
 
-# 3. Get Comments (Limited to first 5 videos for speed/quota testing)
-print("Fetching Comments...")
-comments_df = agent.get_comments(video_ids[:5])
+    # 1. Channel Stats
+    print("Fetching channel stats…")
+    channel_info = agent.get_channel_stats(CHANNEL_ID)
+    print(channel_info)
+    # pd.DataFrame([channel_info]).to_excel("01_channel_stats.xlsx", index=False)
 
-# 4. Sentiment Analysis
-# print("Analyzing Sentiments (Italian)...")
-# comments_df = agent.analyze_sentiment(comments_df)
-comments_df.to_excel("03_sentiment_report.xlsx", index=False)
+    # 2. All Videos
+    print("\nFetching video list…")
+    video_df = agent.get_video_list(channel_info["playlistId"])
+    print(video_df.head())
+    # video_df.to_excel("02_videos.xlsx", index=False)
 
-print("Done! All reports generated.")
+    # 3. Comments for first 5 videos
+    print("\nFetching comments…")
+    top5 = video_df["video_id"].head(5).tolist()
+    comments_df = agent.get_comments(top5, max_comments_per_video=50)
+    print(comments_df.head())
+    # comments_df.to_excel("03_comments.xlsx", index=False)
